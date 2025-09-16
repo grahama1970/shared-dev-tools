@@ -8,7 +8,7 @@ The project aims to support the latest published release on PyPI (when available
 
 Please report suspected security issues privately:
 
-1. Email the maintainers at `security@grahama.dev` with a detailed description of the issue, proof-of-concept if available, and any suggested mitigations.
+1. Email the maintainers at `security@grahama.co` with a detailed description of the issue, proof-of-concept if available, and any suggested mitigations.
 2. Alternatively, open a [GitHub Security Advisory](https://docs.github.com/en/code-security/security-advisories) pointing to this repository. Only maintainers will see your report.
 
 We aim to acknowledge new reports within **3 business days** and keep you informed as we triage the issue.
