@@ -6,5 +6,28 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Virtual environments and local configs
 .venv
+.env
+*.env
+.envrc
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor/tooling data
+.python-version
+.idea/
+.vscode/
+.serena/
+
+# Build artifacts
+scripts/artifacts/
+
+# uv lockfiles (optional)
+uv.lock

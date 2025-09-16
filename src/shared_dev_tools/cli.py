@@ -41,10 +41,14 @@ import typer
 # ---------------------------- Utility helpers ----------------------------
 
 
-def _run_git(root: Path, args: Sequence[str], check: bool = False) -> tuple[int, str, str]:
+def _run_git(
+    root: Path, args: Sequence[str], check: bool = False
+) -> tuple[int, str, str]:
     """Run a git command from a specific root and capture output."""
     cmd = ["git", "-C", str(root), *args]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.returncode, proc.stdout, proc.stderr
@@ -287,11 +291,18 @@ def discover_files(
             args = ["ls-files", "-coi", "--exclude-standard"]
         code, out, err = _run_git(root, args)
         if code != 0:
-            print(f"Warning: git discovery failed, falling back to walk: {err.strip()}", file=sys.stderr)
+            print(
+                f"Warning: git discovery failed, falling back to walk: {err.strip()}",
+                file=sys.stderr,
+            )
         else:
             rels = [line.strip() for line in out.splitlines() if line.strip()]
             # Filter: exclude paths containing any excluded directory at any depth
-            rels = [r for r in rels if not any(part in DEFAULT_EXCLUDE_DIRS for part in r.split("/"))]
+            rels = [
+                r
+                for r in rels
+                if not any(part in DEFAULT_EXCLUDE_DIRS for part in r.split("/"))
+            ]
             if extra_exclude_paths:
                 rels = [r for r in rels if not _matches_any(r, extra_exclude_paths)]
             return [root / r for r in rels if (root / r).is_file()]
@@ -316,7 +327,9 @@ def discover_files(
                 pruned_dirs.append(d)
                 continue
             full_rel = (Path(rel_base) / d).as_posix() if rel_base else d
-            if respect_gitignore and _ignored_by_patterns(full_rel + "/", ignore_patterns):
+            if respect_gitignore and _ignored_by_patterns(
+                full_rel + "/", ignore_patterns
+            ):
                 pruned_dirs.append(d)
         for d in pruned_dirs:
             if d in dirs:
@@ -345,7 +358,9 @@ class FilterOptions:
 
 def should_include_file(path: Path, rel: str, opts: FilterOptions) -> bool:
     # Include patterns bypass extension-based filtering only (not size or binary checks)
-    matched_include = _matches_any(rel, opts.include_patterns) if opts.include_patterns else False
+    matched_include = (
+        _matches_any(rel, opts.include_patterns) if opts.include_patterns else False
+    )
 
     # Skip binaries by extension first
     if path.suffix.lower() in DEFAULT_BINARY_EXTS and not matched_include:
@@ -434,9 +449,16 @@ def write_bundle(
 
             # File header block
             file_header = f"\n\n====== BEGIN FILE: {rel} ======\n"
-            file_footer = f"\n====== END FILE ======\n"
+            file_footer = "\n====== END FILE ======\n"
 
-            block = file_header + fence_open + content + ("\n" if not content.endswith("\n") else "") + fence_close + file_footer
+            block = (
+                file_header
+                + fence_open
+                + content
+                + ("\n" if not content.endswith("\n") else "")
+                + fence_close
+                + file_footer
+            )
             block_b = block.encode(encoding, errors="replace")
 
             if total_bytes + len(block_b) > max_total_bytes:
@@ -453,7 +475,9 @@ def write_bundle(
 
 
 def build_cli() -> typer.Typer:
-    app = typer.Typer(help="Concatenate selected project files into a single bundle for LLMs")
+    app = typer.Typer(
+        help="Concatenate selected project files into a single bundle for LLMs"
+    )
 
     @app.callback(invoke_without_command=True)
     def run(
@@ -499,9 +523,15 @@ def build_cli() -> typer.Typer:
             "--max-total-bytes",
             help="Stop writing once total bytes in output reach this threshold",
         ),
-        encoding: str = typer.Option("utf-8", "--encoding", help="Encoding used to read files and write output"),
-        list_only: bool = typer.Option(False, "--list", help="List selected files and exit (no bundle writing)"),
-        dry_run: bool = typer.Option(False, "--dry-run", help="Do not write output, only print selection summary"),
+        encoding: str = typer.Option(
+            "utf-8", "--encoding", help="Encoding used to read files and write output"
+        ),
+        list_only: bool = typer.Option(
+            False, "--list", help="List selected files and exit (no bundle writing)"
+        ),
+        dry_run: bool = typer.Option(
+            False, "--dry-run", help="Do not write output, only print selection summary"
+        ),
     ) -> None:
         """Create a bundle or list selected files."""
 
@@ -550,6 +580,7 @@ def build_cli() -> typer.Typer:
         typer.echo(f"Wrote {written} files to {output} ({total} bytes)")
 
     return app
+
 
 app = build_cli()
 
