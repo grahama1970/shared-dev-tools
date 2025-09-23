@@ -7,9 +7,9 @@ Features
 - Flexible selection: include extra filename globs or extensions; exclude paths; opt-in to include ignored files.
 - Clear file boundaries with Markdown fences for LLM-friendly ingestion.
 
-Examples
+Examples (agent-friendly)
   # Standard run (respects .gitignore if in Git)
-  bundle-files --root . --output bundle.txt
+  bundle-files --root . --output bundle.md
 
   # Include extra file types or special filenames (globs on names)
   bundle-files --include-ext ".proto,Justfile,vite.config.ts"
@@ -22,18 +22,28 @@ Examples
 
   # Ignore .gitignore entirely (fallback walk only)
   bundle-files --no-respect-gitignore
+
+  # Explicit file list (repeat --file) + persona preface, single concatenated output
+  bundle-files --file a.py --file b.py --prefix-file scripts/review/persona.md \
+               --single-file --output bundle.md
+
+  # Large list from a file
+  bundle-files --files-from scripts/review/files.txt --output bundle.md
 """
 
 from __future__ import annotations
+
 import fnmatch
+import json
+import math
 import os
+import io
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Iterable, List, Optional, Sequence, Set, Callable
 
 import typer
 
@@ -64,7 +74,13 @@ def _now_utc_iso() -> str:
 
 
 def _posix_rel_path(path: Path, start: Path) -> str:
-    return path.relative_to(start).as_posix()
+    """Best-effort repo-relative path; falls back to absolute POSIX if outside root."""
+    p = path.resolve()
+    s = start.resolve()
+    try:
+        return p.relative_to(s).as_posix()
+    except Exception:
+        return p.as_posix()
 
 
 def _read_text(path: Path, encoding: str = "utf-8") -> str:
@@ -197,6 +213,98 @@ LANG_BY_EXT = {
     ".hpp": "cpp",
     ".cs": "cs",
 }
+
+
+# ---------------------------- Token estimation ----------------------------
+
+
+def _make_token_estimator(spec: Optional[str]) -> Callable[[str], int]:
+    """Return a callable(text)->int based on estimator spec.
+
+    - None or "char" => ~4 chars/token heuristic
+    - "tiktoken:<model>" => use tiktoken encoding if available, else fallback
+    """
+
+    if not spec or spec == "char":
+        return lambda s: math.ceil(len(s) / 4) if s else 0
+
+    if spec.startswith("tiktoken:"):
+        model = spec.split(":", 1)[1] or ""
+        try:
+            import tiktoken  # type: ignore
+
+            enc = (
+                tiktoken.get_encoding("cl100k_base")
+                if not model
+                else tiktoken.encoding_for_model(model)
+            )
+
+            def _tok(s: str) -> int:
+                if not s:
+                    return 0
+                try:
+                    return len(enc.encode(s))
+                except Exception:
+                    return math.ceil(len(s) / 4)
+
+            return _tok
+        except Exception:
+            # Silent fallback to char heuristic
+            return lambda s: math.ceil(len(s) / 4) if s else 0
+
+    # Unknown spec => fallback
+    return lambda s: math.ceil(len(s) / 4) if s else 0
+
+
+@dataclass
+class _TokenCacheEntry:
+    size: int
+    mtime_ns: int
+    estimator: str
+    tokens: int
+
+
+class _TokenCache:
+    def __init__(self, path: Optional[Path]) -> None:
+        self.path = path
+        self.data: dict[str, _TokenCacheEntry] = {}
+        if path is not None and path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                for k, v in raw.items():
+                    self.data[k] = _TokenCacheEntry(**v)
+            except Exception:
+                self.data = {}
+
+    def make_key(self, file_path: Path, estimator: str) -> str:
+        try:
+            st = file_path.stat()
+            return f"{file_path.resolve()}::{st.st_size}::{st.st_mtime_ns}::{estimator}"
+        except Exception:
+            return f"{file_path.resolve()}::0::0::{estimator}"
+
+    def get(self, key: str) -> Optional[int]:
+        ent = self.data.get(key)
+        return ent.tokens if ent else None
+
+    def set(self, key: str, file_path: Path, estimator: str, tokens: int) -> None:
+        try:
+            st = file_path.stat()
+            self.data[key] = _TokenCacheEntry(
+                st.st_size, st.st_mtime_ns, estimator, tokens
+            )
+        except Exception:
+            self.data[key] = _TokenCacheEntry(0, 0, estimator, tokens)
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {k: vars(v) for k, v in self.data.items()}
+            self.path.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:
+            pass
 
 
 def _lang_for_file(path: Path) -> str:
@@ -385,23 +493,248 @@ def should_include_file(path: Path, rel: str, opts: FilterOptions) -> bool:
 # ---------------------------- Concatenation ----------------------------
 
 
-def write_bundle(
+@dataclass
+class BundleResult:
+    path: Path
+    file_count: int
+    total_bytes: int
+    total_tokens: int
+    exceeded_token_limit: bool
+    exceeded_byte_limit: bool
+    skipped_unreadable: int
+
+
+@dataclass
+class _BundleBlock:
+    text: str
+    tokens: int
+    bytes_len: int
+    is_file: bool
+    skip: bool = False
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate token count using a simple character heuristic."""
+    if not text:
+        return 0
+    return math.ceil(len(text) / 4)
+
+
+def _format_bundle_header(
+    *,
+    root: Path,
+    git_desc: str,
+    file_count: int,
+    part_index: int,
+    generated_ts: str,
+    max_tokens: Optional[int],
+) -> str:
+    lines = [
+        "# Project Bundle",
+        "",
+        f"- Generated: {generated_ts}",
+        f"- Root: {root}",
+        f"- Git: {git_desc or 'n/a'}",
+        f"- Files: {file_count}",
+        f"- Bundle Part: {part_index}",
+    ]
+    if max_tokens:
+        lines.append(f"- Context Tokens Limit: {max_tokens}")
+    lines.extend(["", "---", ""])
+    return "\n".join(lines)
+
+
+def _part_output_path(base: Path, part_index: int) -> Path:
+    if part_index == 1:
+        return base
+    suffixes = "".join(base.suffixes)
+    if suffixes:
+        stem = base.name[: -len(suffixes)]
+        return base.with_name(f"{stem}.part{part_index}{suffixes}")
+    return base.with_name(f"{base.name}.part{part_index}")
+
+
+class _BundleWriter:
+    """Accumulates bundle blocks and writes chunked outputs."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        output: Path,
+        encoding: str,
+        max_total_bytes: int,
+        max_total_tokens: Optional[int],
+        git_desc: str,
+        token_estimator: Callable[[str], int],
+        prefix_text: Optional[str] = None,
+    ) -> None:
+        self.root = root
+        self.base_output = output
+        self.encoding = encoding
+        self.max_total_bytes = max_total_bytes if max_total_bytes > 0 else None
+        self.max_total_tokens = (
+            max_total_tokens if max_total_tokens and max_total_tokens > 0 else None
+        )
+        self.git_desc = git_desc
+        self.generated_ts = _now_utc_iso()
+        self._tok = token_estimator
+        self.prefix_text = prefix_text or ""
+        self.results: List[BundleResult] = []
+        self.part_index = 1
+        self.current_blocks: List[_BundleBlock] = []
+        self.current_tokens_sum = 0
+        self.current_bytes_sum = 0
+        self.current_file_count = 0
+        self.current_overflow_tokens = False
+        self.current_overflow_bytes = False
+        self.current_skips_count = 0
+
+    def _header_for_count(self, file_count: int) -> str:
+        return _format_bundle_header(
+            root=self.root,
+            git_desc=self.git_desc,
+            file_count=file_count,
+            part_index=self.part_index,
+            generated_ts=self.generated_ts,
+            max_tokens=self.max_total_tokens,
+        )
+
+    def _compute_totals(self, block: _BundleBlock) -> tuple[int, int]:
+        file_count = self.current_file_count + (1 if block.is_file else 0)
+        header = self._header_for_count(file_count) + (
+            self.prefix_text if self.prefix_text else ""
+        )
+        header_tokens = self._tok(header)
+        header_bytes = len(header.encode(self.encoding, errors="replace"))
+        total_tokens = header_tokens + self.current_tokens_sum + block.tokens
+        total_bytes = header_bytes + self.current_bytes_sum + block.bytes_len
+        return total_tokens, total_bytes
+
+    def add_block(self, block: _BundleBlock) -> None:
+        total_tokens, total_bytes = self._compute_totals(block)
+        exceeds_tokens = (
+            self.max_total_tokens is not None and total_tokens > self.max_total_tokens
+        )
+        exceeds_bytes = (
+            self.max_total_bytes is not None and total_bytes > self.max_total_bytes
+        )
+
+        if (exceeds_tokens or exceeds_bytes) and self.current_blocks:
+            self._flush_current()
+            total_tokens, total_bytes = self._compute_totals(block)
+            exceeds_tokens = (
+                self.max_total_tokens is not None
+                and total_tokens > self.max_total_tokens
+            )
+            exceeds_bytes = (
+                self.max_total_bytes is not None and total_bytes > self.max_total_bytes
+            )
+
+        self.current_blocks.append(block)
+        self.current_tokens_sum += block.tokens
+        self.current_bytes_sum += block.bytes_len
+        if block.is_file:
+            self.current_file_count += 1
+        if block.skip:
+            self.current_skips_count += 1
+        if exceeds_tokens:
+            self.current_overflow_tokens = True
+        if exceeds_bytes:
+            self.current_overflow_bytes = True
+
+    def _flush_current(self) -> None:
+        header_only = self._header_for_count(self.current_file_count)
+        prefix = self.prefix_text if self.prefix_text else ""
+        header_bytes = len(
+            (header_only + prefix).encode(self.encoding, errors="replace")
+        )
+        header_tokens = self._tok(header_only + prefix)
+        output_path = _part_output_path(self.base_output, self.part_index)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open(
+            "w", encoding=self.encoding, errors="replace", newline="\n"
+        ) as out_f:
+            out_f.write(header_only)
+            if prefix:
+                out_f.write(prefix)
+            for block in self.current_blocks:
+                out_f.write(block.text)
+
+        total_tokens = header_tokens + self.current_tokens_sum
+        total_bytes = header_bytes + self.current_bytes_sum
+        self.results.append(
+            BundleResult(
+                path=output_path,
+                file_count=self.current_file_count,
+                total_bytes=total_bytes,
+                total_tokens=total_tokens,
+                exceeded_token_limit=self.current_overflow_tokens,
+                exceeded_byte_limit=self.current_overflow_bytes,
+                skipped_unreadable=self.current_skips_count,
+            )
+        )
+
+        self.part_index += 1
+        self.current_blocks = []
+        self.current_tokens_sum = 0
+        self.current_bytes_sum = 0
+        self.current_file_count = 0
+        self.current_overflow_tokens = False
+        self.current_overflow_bytes = False
+
+    def _flush_empty(self) -> None:
+        header_only = self._header_for_count(0)
+        prefix = self.prefix_text if self.prefix_text else ""
+        header_bytes = len(
+            (header_only + prefix).encode(self.encoding, errors="replace")
+        )
+        header_tokens = self._tok(header_only + prefix)
+        output_path = _part_output_path(self.base_output, self.part_index)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open(
+            "w", encoding=self.encoding, errors="replace", newline="\n"
+        ) as out_f:
+            out_f.write(header_only)
+            if prefix:
+                out_f.write(prefix)
+
+        self.results.append(
+            BundleResult(
+                path=output_path,
+                file_count=0,
+                total_bytes=header_bytes,
+                total_tokens=header_tokens,
+                exceeded_token_limit=False,
+                exceeded_byte_limit=False,
+                skipped_unreadable=0,
+            )
+        )
+
+        self.part_index += 1
+
+    def finalize(self) -> List[BundleResult]:
+        if self.current_blocks:
+            self._flush_current()
+        elif not self.results:
+            self._flush_empty()
+        return self.results
+
+
+def write_bundles(
     root: Path,
     files: Sequence[Path],
     output: Path,
     encoding: str,
     max_total_bytes: int,
-) -> Tuple[int, int]:
-    """Write a Markdown-formatted bundle with code fences and headers.
+    max_total_tokens: Optional[int],
+    token_estimator: Callable[[str], int],
+    token_estimator_spec: Optional[str],
+    cache_path: Optional[Path],
+    prefix_text: Optional[str],
+) -> List[BundleResult]:
+    """Write one or more Markdown bundle files based on size constraints."""
 
-    Returns (written_files_count, written_bytes_total).
-    """
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    total_bytes = 0
-    written = 0
-
-    # Compute Git metadata if available
     git_desc = ""
     if _is_git_repo(root):
         code, out, _ = _run_git(root, ["rev-parse", "--short", "HEAD"])
@@ -410,65 +743,72 @@ def write_bundle(
         dirty = "+dirty" if out.strip() else ""
         git_desc = f"{rev}{dirty}"
 
-    header = textwrap.dedent(
-        f"""
-        # Project Bundle
+    cache = _TokenCache(cache_path) if cache_path is not None else _TokenCache(None)
 
-        - Generated: {_now_utc_iso()}
-        - Root: {root}
-        - Git: {git_desc or 'n/a'}
-        - Files: {len(files)}
+    writer = _BundleWriter(
+        root=root,
+        output=output,
+        encoding=encoding,
+        max_total_bytes=max_total_bytes,
+        max_total_tokens=max_total_tokens,
+        git_desc=git_desc,
+        token_estimator=token_estimator,
+        prefix_text=prefix_text,
+    )
 
-        ---
-        """
-    ).lstrip("\n")
-
-    header_bytes = header.encode(encoding, errors="replace")
-
-    with output.open("w", encoding=encoding, errors="replace", newline="\n") as out_f:
-        out_f.write(header)
-        total_bytes += len(header_bytes)
-
-        for p in files:
-            rel = _posix_rel_path(p, root)
-            try:
-                content = _read_text(p, encoding=encoding)
-            except Exception as e:  # noqa: BLE001
-                # Skip unreadable files but make it visible in bundle
-                msg = f"[SKIP unreadable: {rel}: {e}]\n\n"
-                msg_b = msg.encode(encoding, errors="replace")
-                if total_bytes + len(msg_b) > max_total_bytes:
-                    break
-                out_f.write(msg)
-                total_bytes += len(msg_b)
-                continue
-
-            lang = _lang_for_file(p)
-            fence_open = f"```{lang}\n" if lang else "```\n"
-            fence_close = "```\n"
-
-            # File header block
-            file_header = f"\n\n====== BEGIN FILE: {rel} ======\n"
-            file_footer = "\n====== END FILE ======\n"
-
-            block = (
-                file_header
-                + fence_open
-                + content
-                + ("\n" if not content.endswith("\n") else "")
-                + fence_close
-                + file_footer
+    for path in files:
+        rel = _posix_rel_path(path, root)
+        try:
+            content = _read_text(path, encoding=encoding)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"[SKIP unreadable: {rel}: {exc}]\n\n"
+            block = _BundleBlock(
+                text=msg,
+                tokens=token_estimator(msg),
+                bytes_len=len(msg.encode(encoding, errors="replace")),
+                is_file=False,
+                skip=True,
             )
-            block_b = block.encode(encoding, errors="replace")
+            key = cache.make_key(path, token_estimator_spec or "char")
+            if cache.get(key) is None:
+                cache.set(key, path, token_estimator_spec or "char", block.tokens)
+            writer.add_block(block)
+            continue
 
-            if total_bytes + len(block_b) > max_total_bytes:
-                break
+        lang = _lang_for_file(path)
+        fence_open = f"```{lang}\n" if lang else "```\n"
+        fence_close = "```\n"
+        file_header = f"\n\n====== BEGIN FILE: {rel} ======\n"
+        file_footer = "\n====== END FILE ======\n"
 
-            out_f.write(block)
-            written += 1
-            total_bytes += len(block_b)
+        block_text = (
+            file_header
+            + fence_open
+            + content
+            + ("\n" if not content.endswith("\n") else "")
+            + fence_close
+            + file_footer
+        )
+        block = _BundleBlock(
+            text=block_text,
+            tokens=(
+                cache.get(cache.make_key(path, token_estimator_spec or "char"))
+                or token_estimator(block_text)
+            ),
+            bytes_len=len(block_text.encode(encoding, errors="replace")),
+            is_file=True,
+        )
+        key = cache.make_key(path, token_estimator_spec or "char")
+        if cache.get(key) is None:
+            cache.set(key, path, token_estimator_spec or "char", block.tokens)
+        writer.add_block(block)
 
-    return written, total_bytes
+    res = writer.finalize()
+    try:
+        cache.save()
+    except Exception:
+        pass
+    return res
 
 
 # ---------------------------- Typer CLI ----------------------------
@@ -476,14 +816,25 @@ def write_bundle(
 
 def build_cli() -> typer.Typer:
     app = typer.Typer(
-        help="Concatenate selected project files into a single bundle for LLMs"
+        help="Concatenate selected project files into one or more bundles for LLMs"
     )
 
     @app.callback(invoke_without_command=True)
     def run(
+        # Selection
         root: Path = typer.Option(Path("."), "--root", help="Project root to scan"),
+        file: List[Path] = typer.Option(
+            None,
+            "--file",
+            help="Explicit file to include (repeatable). When present, discovery is skipped.",
+        ),
+        files_from: Optional[Path] = typer.Option(
+            None,
+            "--files-from",
+            help="Text file with one path per line (explicit selection).",
+        ),
         output: Path = typer.Option(
-            Path("bundle.txt"),
+            Path("bundle.md"),
             "--output",
             "-o",
             help="Output path for the concatenated bundle",
@@ -523,8 +874,78 @@ def build_cli() -> typer.Typer:
             "--max-total-bytes",
             help="Stop writing once total bytes in output reach this threshold",
         ),
+        context_length: int = typer.Option(
+            400_000,
+            "--context-length",
+            help="Approximate token capacity per bundle part before splitting; set 0 to disable token-based chunking.",
+        ),
+        single_file: bool = typer.Option(
+            False,
+            "--single-file",
+            help="Force a single concatenated Markdown file (disables token/byte splitting).",
+        ),
+        token_estimator: Optional[str] = typer.Option(
+            None,
+            "--token-estimator",
+            help="Token estimator to use: 'char' (default) or 'tiktoken:<model>' if tiktoken is available",
+        ),
+        changed_since: Optional[str] = typer.Option(
+            None,
+            "--changed-since",
+            help="Limit selection to files changed since the given Git revision (requires Git repo)",
+        ),
+        output_dir: Optional[Path] = typer.Option(
+            None,
+            "--output-dir",
+            help="If provided, write output under this directory using --output or --output-base",
+        ),
+        output_base: Optional[str] = typer.Option(
+            None,
+            "--output-base",
+            help="Base name for output file (e.g., 'bundle.md'); used with --output-dir",
+        ),
+        prefix_file: Optional[Path] = typer.Option(
+            None,
+            "--prefix-file",
+            help="Path to a file whose contents will be inserted at the top of each bundle part",
+        ),
+        cache_dir: Optional[Path] = typer.Option(
+            None,
+            "--cache-dir",
+            help="Directory to store token estimation cache (optional)",
+        ),
         encoding: str = typer.Option(
             "utf-8", "--encoding", help="Encoding used to read files and write output"
+        ),
+        json_output: bool = typer.Option(
+            False,
+            "--json",
+            help="Emit machine-readable JSON to stdout instead of friendly text",
+        ),
+        index: Optional[Path] = typer.Option(
+            None,
+            "--index",
+            help="Optional path to also write the JSON result (when --json)",
+        ),
+        manifest: Optional[Path] = typer.Option(
+            None,
+            "--manifest",
+            help="Optional path to write a manifest.json (inputs, parts, checksums, budgets)",
+        ),
+        archive: Optional[str] = typer.Option(
+            None,
+            "--archive",
+            help="Package parts + index + manifest into an archive: 'zip' or 'tar'",
+        ),
+        archive_files: Optional[str] = typer.Option(
+            None,
+            "--archive-files",
+            help="Package ORIGINAL selected files (preserving relative paths) plus BUNDLE_INSTRUCTIONS.md; also includes index/manifest if provided: 'zip' or 'tar'",
+        ),
+        strict: bool = typer.Option(
+            False,
+            "--strict",
+            help="Exit non-zero if any part exceeds limits or if any files were skipped as unreadable",
         ),
         list_only: bool = typer.Option(
             False, "--list", help="List selected files and exit (no bundle writing)"
@@ -539,12 +960,51 @@ def build_cli() -> typer.Typer:
         include_patterns = _parse_csv_list(include_ext or "")
         extra_excludes = _parse_csv_list(extra_exclude_paths or "")
 
-        files_all = discover_files(
-            root=root_resolved,
-            respect_gitignore=not no_respect_gitignore,
-            include_ignored=include_ignored,
-            extra_exclude_paths=extra_excludes,
-        )
+        # If explicit selection provided, use only that.
+        explicit: List[Path] = []
+        if file:
+            explicit.extend(
+                [p if p.is_absolute() else (root_resolved / p) for p in file]
+            )
+        if files_from and files_from.is_file():
+            for line in _read_text(files_from).splitlines():
+                s = line.strip()
+                if s:
+                    p = Path(s)
+                    explicit.append(p if p.is_absolute() else (root_resolved / p))
+
+        if explicit:
+            files_all = [p.resolve() for p in explicit if p.exists()]
+        else:
+            files_all = discover_files(
+                root=root_resolved,
+                respect_gitignore=not no_respect_gitignore,
+                include_ignored=include_ignored,
+                extra_exclude_paths=extra_excludes,
+            )
+
+        # If changed_since provided and repo available, narrow to changed files
+        if changed_since and _is_git_repo(root_resolved) and not explicit:
+            code, out, err = _run_git(
+                root_resolved, ["diff", "--name-only", f"{changed_since}", "--"]
+            )
+            if code == 0:
+                changed = [
+                    (root_resolved / line.strip())
+                    for line in out.splitlines()
+                    if line.strip()
+                ]
+                changed = [p for p in changed if p.is_file()]
+                if extra_excludes:
+                    changed = [
+                        p
+                        for p in changed
+                        if not _matches_any(
+                            _posix_rel_path(p, root_resolved), extra_excludes
+                        )
+                    ]
+                if changed:
+                    files_all = changed
 
         fopts = FilterOptions(
             include_patterns=include_patterns,
@@ -560,24 +1020,318 @@ def build_cli() -> typer.Typer:
 
         selected.sort(key=lambda x: _posix_rel_path(x, root_resolved))
 
+        # Load optional prefix text
+        prefix_text = ""
+        if prefix_file is not None:
+            try:
+                prefix_text = _read_text(prefix_file, encoding=encoding)
+                if prefix_text and not prefix_text.endswith("\n\n"):
+                    prefix_text += "\n\n"
+            except Exception:
+                prefix_text = ""
+
+        cache_path = None
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = (cache_dir / "token_cache.json").resolve()
+
+        # Compute effective output path if output_dir/base provided
+        effective_output = output
+        if output_dir is not None or output_base is not None:
+            base_name = output_base or output.name
+            effective_output = (output_dir or output.parent) / base_name
+
         if list_only or dry_run:
-            typer.echo(f"Root: {root_resolved}")
-            typer.echo(
-                f"Git: {'yes' if _is_git_repo(root_resolved) else 'no'} (respect={not no_respect_gitignore}, include_ignored={include_ignored})"
-            )
-            typer.echo(f"Candidates: {len(files_all)}  -> Selected: {len(selected)}")
-            for p in selected:
-                typer.echo(_posix_rel_path(p, root_resolved))
+            if json_output:
+                payload = {
+                    "root": str(root_resolved),
+                    "git": bool(_is_git_repo(root_resolved)),
+                    "respect_gitignore": not no_respect_gitignore,
+                    "include_ignored": include_ignored,
+                    "candidates": len(files_all),
+                    "selected": len(selected),
+                    "files": [_posix_rel_path(p, root_resolved) for p in selected],
+                    "generated": _now_utc_iso(),
+                }
+                text = json.dumps(payload)
+                typer.echo(text)
+                if index is not None:
+                    index.parent.mkdir(parents=True, exist_ok=True)
+                    index.write_text(text, encoding="utf-8")
+            else:
+                typer.echo(f"Root: {root_resolved}")
+                typer.echo(
+                    f"Git: {'yes' if _is_git_repo(root_resolved) else 'no'} (respect={not no_respect_gitignore}, include_ignored={include_ignored})"
+                )
+                typer.echo(
+                    f"Candidates: {len(files_all)}  -> Selected: {len(selected)}"
+                )
+                for p in selected:
+                    typer.echo(_posix_rel_path(p, root_resolved))
             raise typer.Exit(0)
 
-        written, total = write_bundle(
+        # Limits: single-file disables token/byte splitting entirely
+        token_limit = (
+            None if single_file else (context_length if context_length > 0 else None)
+        )
+        effective_max_bytes = None if single_file else max_total_bytes
+        tok = _make_token_estimator(token_estimator)
+
+        results = write_bundles(
             root=root_resolved,
             files=selected,
-            output=output,
+            output=effective_output,
             encoding=encoding,
-            max_total_bytes=max_total_bytes,
+            max_total_bytes=(
+                effective_max_bytes
+                if effective_max_bytes is not None
+                else max_total_bytes
+            ),
+            max_total_tokens=token_limit,
+            token_estimator=tok,
+            token_estimator_spec=token_estimator,
+            cache_path=cache_path,
+            prefix_text=prefix_text,
         )
-        typer.echo(f"Wrote {written} files to {output} ({total} bytes)")
+
+        # Tool meta
+        def _tool_meta() -> tuple[str, str]:
+            tool_name = "bundle-files"
+            tool_ver = "0.1.0"
+            try:
+                import tomllib  # py311+
+
+                pyproj = root_resolved / "pyproject.toml"
+                if pyproj.is_file():
+                    data = tomllib.loads(pyproj.read_text(encoding="utf-8"))
+                    tool_ver = data.get("project", {}).get("version", tool_ver)
+            except Exception:
+                pass
+            return tool_name, tool_ver
+
+        schema_version = "bundle_index_v1"
+        tool_name, tool_version = _tool_meta()
+
+        import hashlib
+        import tarfile
+        import zipfile
+
+        manifest_path = None
+        archive_path = None
+        if manifest is not None:
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            parts_list = []
+            for r in results:
+                p = (
+                    root_resolved / r.path
+                    if not Path(r.path).is_absolute()
+                    else Path(r.path)
+                )
+                try:
+                    with open(p, "rb") as f:
+                        h = hashlib.sha256()
+                        for chunk in iter(lambda: f.read(8192), b""):
+                            h.update(chunk)
+                    sha256 = h.hexdigest()
+                except Exception:
+                    sha256 = ""
+                parts_list.append(
+                    {
+                        "path": str(r.path),
+                        "bytes": r.total_bytes,
+                        "tokens": r.total_tokens,
+                        "sha256": sha256,
+                    }
+                )
+            manifest_payload = {
+                "schema_version": "bundle_manifest_v1",
+                "tool_name": tool_name,
+                "tool_version": tool_version,
+                "generated": _now_utc_iso(),
+                "root": str(root_resolved),
+                "base_output": str((root_resolved / effective_output).resolve()),
+                "context_length": token_limit,
+                "max_total_bytes": max_total_bytes,
+                "selected_files": [_posix_rel_path(p, root_resolved) for p in selected],
+                "parts": parts_list,
+            }
+            manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+            manifest_path = manifest
+
+        if archive in {"zip", "tar"}:
+            base = effective_output
+            base_stem = base.with_suffix("") if base.suffix else base
+            if archive == "zip":
+                archive_path = base_stem.with_suffix(".zip")
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(
+                    archive_path, "w", compression=zipfile.ZIP_DEFLATED
+                ) as zf:
+                    for r in results:
+                        zf.write(r.path, arcname=Path(r.path).name)
+                    if index is not None and index.exists():
+                        zf.write(index, arcname=index.name)
+                    if manifest_path is not None and manifest_path.exists():
+                        zf.write(manifest_path, arcname=manifest_path.name)
+            else:
+                archive_path = base_stem.with_suffix(".tar")
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(archive_path, "w") as tf:
+                    for r in results:
+                        tf.add(r.path, arcname=Path(r.path).name)
+                    if index is not None and index.exists():
+                        tf.add(index, arcname=index.name)
+                    if manifest_path is not None and manifest_path.exists():
+                        tf.add(manifest_path, arcname=manifest_path.name)
+
+        # Optional: package original selected files with directory structure + instructions
+        files_archive_path = None
+        if archive_files in {"zip", "tar"}:
+            base = effective_output
+            base_stem = base.with_suffix("") if base.suffix else base
+
+            # Build a simple file list (repo-relative) for context
+            rel_files = sorted(_posix_rel_path(p, root_resolved) for p in selected)
+            file_list_section = "\n".join(f"- {rf}" for rf in rel_files)
+
+            instruction_text = (
+                "# Bundle Instructions\n\n"
+                f"- Generated: {_now_utc_iso()}\n"
+                f"- Root: {root_resolved}\n"
+                f"- Files included: {len(selected)}\n"
+                "- Structure: Original selected files under their repo-relative paths.\n"
+                "- Sidecars: manifest.json (checksums), index.json (CLI JSON summary) if present.\n\n"
+                "Directory structure (relative file list):\n"
+                f"{file_list_section}\n\n"
+                "Notes:\n"
+                "- Use the Markdown bundle parts (*.md) alongside this archive for LLM ingestion.\n"
+            )
+
+            if archive_files == "zip":
+                files_archive_path = base_stem.with_suffix(".files.zip")
+                files_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(
+                    files_archive_path, "w", compression=zipfile.ZIP_DEFLATED
+                ) as zf:
+                    # Instruction document
+                    zf.writestr("BUNDLE_INSTRUCTIONS.md", instruction_text)
+                    # Original files with relative paths
+                    for p in selected:
+                        rel = _posix_rel_path(p, root_resolved)
+                        zf.write(p, arcname=rel)
+                    # Include index/manifest sidecars if provided (index may be written after archiving)
+                    if manifest_path is not None and manifest_path.exists():
+                        zf.write(manifest_path, arcname=manifest_path.name)
+                    if index is not None and index.exists():
+                        zf.write(index, arcname=index.name)
+            else:
+                files_archive_path = base_stem.with_suffix(".files.tar")
+                files_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(files_archive_path, "w") as tf2:
+                    # Instruction document
+                    ins_bytes = instruction_text.encode("utf-8")
+                    ti = tarfile.TarInfo("BUNDLE_INSTRUCTIONS.md")
+                    ti.size = len(ins_bytes)
+                    tf2.addfile(ti, io.BytesIO(ins_bytes))
+                    # Original files with relative paths
+                    for p in selected:
+                        rel = _posix_rel_path(p, root_resolved)
+                        tf2.add(p, arcname=rel)
+                    # Include index/manifest sidecars if provided (index may be written after archiving)
+                    if manifest_path is not None and manifest_path.exists():
+                        tf2.add(manifest_path, arcname=manifest_path.name)
+                    if index is not None and index.exists():
+                        tf2.add(index, arcname=index.name)
+
+        # (keep the first “archive original files” block above; remove this duplicate)
+
+        if json_output:
+            reasons = []
+            if any(r.exceeded_token_limit for r in results):
+                reasons.append("tokens_over_limit")
+            if any(r.exceeded_byte_limit for r in results):
+                reasons.append("bytes_over_limit")
+            if any(r.skipped_unreadable > 0 for r in results):
+                reasons.append("skipped_unreadable")
+
+            payload = {
+                "schema_version": schema_version,
+                "tool_name": tool_name,
+                "tool_version": tool_version,
+                "root": str(root_resolved),
+                "base_output": str((root_resolved / effective_output).resolve()),
+                "context_length": token_limit,
+                "max_total_bytes": max_total_bytes,
+                "encoding": encoding,
+                "generated": _now_utc_iso(),
+                "parts": [
+                    {
+                        "path": str(r.path),
+                        "file_count": r.file_count,
+                        "bytes": r.total_bytes,
+                        "tokens": r.total_tokens,
+                        "exceeded_token_limit": r.exceeded_token_limit,
+                        "exceeded_byte_limit": r.exceeded_byte_limit,
+                        "skipped_unreadable": r.skipped_unreadable,
+                    }
+                    for r in results
+                ],
+                "status": "strict_failed" if (strict and reasons) else "ok",
+                "reasons": reasons,
+            }
+            if manifest_path is not None:
+                payload["manifest_path"] = str(manifest_path)
+            if archive_path is not None:
+                payload["archive_path"] = str(archive_path)
+            if "files_archive_path" in locals() and files_archive_path is not None:
+                payload["files_archive_path"] = str(files_archive_path)
+            text = json.dumps(payload)
+            typer.echo(text)
+            if index is not None:
+                index.parent.mkdir(parents=True, exist_ok=True)
+                index.write_text(text, encoding="utf-8")
+            if strict and reasons:
+                raise typer.Exit(1)
+        else:
+            total_files_written = sum(res.file_count for res in results)
+            if len(results) == 1:
+                res = results[0]
+                typer.echo(
+                    f"Wrote {res.file_count} files to {res.path} ({res.total_bytes} bytes, tokens~{res.total_tokens})"
+                )
+                if res.exceeded_token_limit:
+                    typer.echo(
+                        "Warning: bundle exceeds --context-length tokens; consider reducing selection or lowering the limit.",
+                        err=True,
+                    )
+                if res.exceeded_byte_limit:
+                    typer.echo(
+                        "Warning: bundle exceeds --max-total-bytes; consider adjusting limits.",
+                        err=True,
+                    )
+            else:
+                limit_desc = "disabled" if token_limit is None else str(token_limit)
+                typer.echo(
+                    f"Wrote {total_files_written} files across {len(results)} bundles (context-length {limit_desc})"
+                )
+                for idx, res in enumerate(results, start=1):
+                    flags = []
+                    if res.exceeded_token_limit:
+                        flags.append("tokens>limit")
+                    if res.exceeded_byte_limit:
+                        flags.append("bytes>limit")
+                    suffix = f" [{', '.join(flags)}]" if flags else ""
+                    typer.echo(
+                        f"  part {idx}: {res.path} files={res.file_count} bytes={res.total_bytes} tokens~{res.total_tokens}{suffix}"
+                    )
+
+            # Enforce strict exit if any issues detected
+            if strict and (
+                any(r.exceeded_token_limit for r in results)
+                or any(r.exceeded_byte_limit for r in results)
+                or any(r.skipped_unreadable > 0 for r in results)
+            ):
+                raise typer.Exit(1)
 
     return app
 

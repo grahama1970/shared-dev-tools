@@ -1,0 +1,27 @@
+{
+  "name": "shared-dev-tools",
+  "version": "1.0.0",
+  "description": "Utilities and command-line helpers for preparing repository artifacts for large-language-model workflows. The flagship command, `bundle-files`, scans a project, filters files using Git metadata and heuristics, and emits a single Markdown document with language-aware code fences that can be shared with review tools or LLMs.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/grahama1970/shared-dev-tools.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/grahama1970/shared-dev-tools/issues"
+  },
+  "homepage": "https://github.com/grahama1970/shared-dev-tools#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.1"
+  }
+}

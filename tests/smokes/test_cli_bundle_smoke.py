@@ -67,3 +67,83 @@ def test_bundle_cli_smoke(tmp_path: Path) -> None:
     # Ignored and binary files should not appear
     assert "BEGIN FILE: ignored.log" not in bundle_text
     assert "BEGIN FILE: image.png" not in bundle_text
+
+
+def test_bundle_cli_splits_when_context_limit(tmp_path: Path) -> None:
+    """Bundle splits into multiple parts when context-length is low."""
+
+    root = tmp_path / "project"
+    root.mkdir()
+
+    big_line = "print('hello world')\\n" * 300
+    _write_text(root / "alpha.py", big_line)
+    _write_text(root / "beta.py", big_line)
+
+    bundle_path = root / "bundle.md"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "--root",
+            str(root),
+            "--output",
+            str(bundle_path),
+            "--context-length",
+            "200",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+
+    part_two = bundle_path.with_name("bundle.part2.md")
+    assert bundle_path.exists()
+    assert part_two.exists()
+
+    first_text = bundle_path.read_text(encoding="utf-8")
+    second_text = part_two.read_text(encoding="utf-8")
+
+    assert "BEGIN FILE: alpha.py" in first_text
+    assert "BEGIN FILE: beta.py" not in first_text
+    assert "BEGIN FILE: beta.py" in second_text
+
+    # CLI output should reflect multi-bundle summary
+    assert "bundles" in result.stdout
+    assert "part 2" in result.stdout
+
+
+def test_bundle_cli_json_outputs(tmp_path: Path) -> None:
+    """JSON mode returns machine-readable results for list and generate."""
+
+    root = tmp_path / "project"
+    root.mkdir()
+
+    # A couple small files
+    _write_text(root / "a.py", "print('a')\n")
+    _write_text(root / "b.py", "print('b')\n")
+
+    bundle_path = root / "bundle.md"
+    runner = CliRunner()
+
+    # List JSON
+    list_res = runner.invoke(
+        app,
+        ["--root", str(root), "--output", str(bundle_path), "--list", "--json"],
+    )
+    assert list_res.exit_code == 0, list_res.stdout
+    import json as _json
+
+    list_payload = _json.loads(list_res.stdout)
+    assert list_payload["root"].endswith("project")
+    assert isinstance(list_payload["files"], list) and list_payload["files"]
+
+    # Generate JSON
+    gen_res = runner.invoke(
+        app,
+        ["--root", str(root), "--output", str(bundle_path), "--json"],
+    )
+    assert gen_res.exit_code == 0, gen_res.stdout
+    gen_payload = _json.loads(gen_res.stdout)
+    assert gen_payload["base_output"].endswith("bundle.md")
+    assert isinstance(gen_payload["parts"], list) and gen_payload["parts"], gen_payload
+    assert "file_count" in gen_payload["parts"][0]
