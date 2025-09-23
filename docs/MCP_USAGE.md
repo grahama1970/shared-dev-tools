@@ -15,6 +15,47 @@ Strict behavior
 - When `strict: true`, the CLI exits non‑zero if any part exceeded the limits or unreadables were skipped, but it still emits the JSON index.
 - The wrapper surfaces this as JSON and adds `strict_failed: true` and `exit_code`.
 
+Aliases and intent routing
+- Tools are advertised under multiple names to improve agent intent matching:
+  - bundle_list and bundle.list
+  - bundle_generate and bundle.generate
+  - prepare_code_review (alias of bundle.generate)
+  - code_review.prepare (alias of bundle.generate)
+- Natural language mapping guidance:
+  - Phrases like "prepare for code review", "create a code review bundle", "package files for PR review", or "bundle for reviewers" → prefer prepare_code_review or bundle.generate.
+  - Phrases like "list files to include", "what would be bundled", "preview selection" → prefer bundle.list.
+
+Client compatibility: return_links
+- Some MCP clients (including certain VS Code integrations) strictly validate tool content items and may reject "resource" entries.
+- Default behavior in this project: keep return_links=false so the tool returns a single JSON payload that includes an "artifacts" array with absolute file paths and MIME types for generated outputs.
+- When your client supports resource content correctly, you can set return_links=true to also receive resource link items (file:// URIs) alongside the JSON payload.
+
+Additional examples
+```jsonc
+// Generate bundles with JSON-only payload (recommended default for broad client compatibility)
+{
+  "tool": "bundle.generate",
+  "arguments": {
+    "root": "/abs/project",
+    "output": "bundle.md",
+    "context_length": 400000,
+    "strict": true,
+    "index": "/abs/project/artifacts/bundle.index.json",
+    "manifest": "/abs/project/artifacts/manifest.json",
+    "return_links": false
+  }
+}
+
+// Generate bundles and include resource link entries (only if your client supports resource content items)
+{
+  "tool": "prepare_code_review", // alias of bundle.generate
+  "arguments": {
+    "root": "/abs/project",
+    "output": "bundle.md",
+    "return_links": true
+  }
+}
+```
 Examples
 ```jsonc
 // List files without writing outputs
